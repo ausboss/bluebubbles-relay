@@ -134,6 +134,7 @@ If your agent runs on a different machine than the BlueBubbles host, wrap the ca
 | Chats | `chats list`, `chats info`, `chats find` |
 | Messages (read) | `messages list`, `messages search`, `messages get` |
 | Messages (write) | `messages draft`, `messages send`, `messages react`, `messages send-image`, `messages send-sticker` |
+| Reply (auto-resolves chat from a message GUID) | `messages reply`, `messages reply-image`, `messages reply-sticker` |
 | Attachments | `attachments download` |
 | Stickers | `stickers list` |
 

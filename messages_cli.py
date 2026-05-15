@@ -115,7 +115,20 @@ def _api_download(path: str, out_path: Path) -> int:
     params = {"password": _read_password()}
     with requests.get(f"{BASE_URL}{path}", params=params, stream=True, timeout=DOWNLOAD_TIMEOUT_S) as r:
         if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code} downloading {path}")
+            # iMessage GCs old media off disk while keeping the message + attachment
+            # metadata, so a 404 on a known-good attachment GUID usually means the
+            # file has been purged from this Mac's cache and is unrecoverable.
+            if r.status_code == 404:
+                raise RuntimeError(
+                    "attachment metadata exists but the file has been purged from this Mac's "
+                    "iMessage cache (HTTP 404). Old media is GCd locally; nothing to download."
+                )
+            try:
+                body = r.json()
+                detail = body.get("message") or body.get("error") or body
+            except Exception:
+                detail = r.text[:200]
+            raise RuntimeError(f"HTTP {r.status_code} downloading attachment: {detail}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         written = 0
         with out_path.open("wb") as f:
@@ -123,12 +136,35 @@ def _api_download(path: str, out_path: Path) -> int:
                 if chunk:
                     f.write(chunk)
                     written += len(chunk)
+        if written == 0:
+            # Some BlueBubbles versions return 200 + empty body when the file is missing.
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                "BlueBubbles returned an empty response for this attachment — the file is "
+                "likely metadata-only on this Mac (iMessage cache GC). Nothing to download."
+            )
         return written
 
 
 def _summarize_message(m: dict) -> dict:
     chat = (m.get("chats") or [{}])[0]
     handle = m.get("handle") or {}
+    raw_attachments = m.get("attachments") or []
+    attachments = [
+        {
+            "guid": a.get("guid"),
+            "transferName": a.get("transferName"),
+            "mimeType": a.get("mimeType"),
+            "totalBytes": a.get("totalBytes"),
+        }
+        for a in raw_attachments
+    ]
+    # BlueBubbles' top-level hasAttachments flag is unreliable in list views,
+    # so derive it from the actual attachment metadata when we have it.
+    has_attachments = bool(attachments) if attachments else bool(m.get("hasAttachments"))
     return {
         "guid": m.get("guid"),
         "chatGuid": chat.get("guid"),
@@ -138,7 +174,8 @@ def _summarize_message(m: dict) -> dict:
         "text": _short_text(m.get("text"), 500),
         "dateCreated": m.get("dateCreated"),
         "dateRead": m.get("dateRead"),
-        "hasAttachments": bool(m.get("hasAttachments")),
+        "hasAttachments": has_attachments,
+        "attachments": attachments,
     }
 
 
@@ -325,7 +362,7 @@ def cmd_messages_list(args):
     body: dict = {
         "limit": args.limit,
         "offset": 0,
-        "with": ["chat", "handle"],
+        "with": ["chat", "handle", "attachment"],
         "sort": "DESC",
     }
     if args.since:
@@ -448,7 +485,7 @@ def cmd_messages_search(args):
     body: dict = {
         "limit": args.limit,
         "offset": 0,
-        "with": ["chat", "handle"],
+        "with": ["chat", "handle", "attachment"],
         "sort": "DESC",
         "where": [
             {"statement": "message.text LIKE :text", "args": {"text": f"%{args.query}%"}}
@@ -568,6 +605,62 @@ def cmd_messages_send_image(args):
     return _envelope(True, "messages send-image", result="image sent", details=details)
 
 
+def _resolve_chat_from_message(message_guid: str) -> str:
+    """Look up the chat GUID that owns a given message GUID. Single API call."""
+    resp = _api("GET", f"/api/v1/message/{message_guid}", params={"with": "chat"})
+    md = resp.get("data") or {}
+    chat = (md.get("chats") or [{}])[0]
+    chat_guid = chat.get("guid")
+    if not chat_guid:
+        raise RuntimeError(f"could not resolve chat for message {message_guid}")
+    return chat_guid
+
+
+def cmd_messages_reply(args):
+    if not args.confirm:
+        return _envelope(False, "messages reply", error="--confirm is required to actually send.")
+    chat_guid = _resolve_chat_from_message(args.message)
+    body = {
+        "chatGuid": chat_guid,
+        "tempGuid": f"relay-{int(time.time() * 1000)}",
+        "message": args.text,
+        "method": "apple-script",
+    }
+    data = _api("POST", "/api/v1/message/text", json_body=body)
+    d = data.get("data") or {}
+    return _envelope(
+        True, "messages reply",
+        result=f"reply sent to chat {chat_guid}",
+        details={
+            "guid": d.get("guid"),
+            "replyToMessage": args.message,
+            "chatGuid": chat_guid,
+            "text": args.text,
+            "dateCreated": d.get("dateCreated"),
+        },
+    )
+
+
+def cmd_messages_reply_image(args):
+    if not args.confirm:
+        return _envelope(False, "messages reply-image", error="--confirm is required to actually send.")
+    chat_guid = _resolve_chat_from_message(args.message)
+    details = _send_image_inner(chat_guid, args.source, args.text)
+    details["replyToMessage"] = args.message
+    return _envelope(True, "messages reply-image", result=f"reply image sent to chat {chat_guid}", details=details)
+
+
+def cmd_messages_reply_sticker(args):
+    if not args.confirm:
+        return _envelope(False, "messages reply-sticker", error="--confirm is required to actually send.")
+    chat_guid = _resolve_chat_from_message(args.message)
+    path = _resolve_sticker(args.name)
+    details = _send_image_inner(chat_guid, str(path), args.text)
+    details["sticker"] = args.name
+    details["replyToMessage"] = args.message
+    return _envelope(True, "messages reply-sticker", result=f"reply sticker {args.name!r} sent to chat {chat_guid}", details=details)
+
+
 def cmd_stickers_list(_args):
     if not STICKERS_DIR.exists():
         return _envelope(True, "stickers list", result="0 sticker(s)", details={"count": 0, "stickers": []})
@@ -653,6 +746,23 @@ def main():
     mst.add_argument("--text", help="optional caption sent as a follow-up message")
     mst.add_argument("--confirm", action="store_true", help="required to actually send")
     mst.set_defaults(func=cmd_messages_send_sticker)
+    mrp = msgs.add_parser("reply", help="Reply to a message — auto-resolves the chat (requires --confirm)")
+    mrp.add_argument("message", help="message GUID to reply to")
+    mrp.add_argument("text", help="reply body")
+    mrp.add_argument("--confirm", action="store_true", help="required to actually send")
+    mrp.set_defaults(func=cmd_messages_reply)
+    mri = msgs.add_parser("reply-image", help="Reply to a message with an image (requires --confirm)")
+    mri.add_argument("message", help="message GUID to reply to")
+    mri.add_argument("source", help="local file path or http(s) URL")
+    mri.add_argument("--text", help="optional caption sent as a follow-up message")
+    mri.add_argument("--confirm", action="store_true", help="required to actually send")
+    mri.set_defaults(func=cmd_messages_reply_image)
+    mrs = msgs.add_parser("reply-sticker", help="Reply to a message with a sticker from stickers/ (requires --confirm)")
+    mrs.add_argument("message", help="message GUID to reply to")
+    mrs.add_argument("name", help="sticker name (without extension)")
+    mrs.add_argument("--text", help="optional caption sent as a follow-up message")
+    mrs.add_argument("--confirm", action="store_true", help="required to actually send")
+    mrs.set_defaults(func=cmd_messages_reply_sticker)
 
     att = sub.add_parser("attachments", help="Attachment operations").add_subparsers(dest="action", required=True)
     ad = att.add_parser("download", help="Download an attachment by GUID")

@@ -52,10 +52,10 @@ The CLI reads the BlueBubbles password at call-time from BlueBubbles' own config
 | `chats list [--limit N]` | Most-recent chats with a last-message preview |
 | `chats info <chat-guid>` | Chat metadata (participants, display name) |
 | `chats find <query> [--limit N] [--scan M]` | **Fuzzy resolution** — turn a casual name or partial phone/email into chat GUIDs |
-| `messages list [--since 5m\|1h\|2d] [--chat <guid>] [--limit N]` | Recent messages. The bread-and-butter call for "any new texts?". Incoming reactions are grouped onto their target under `reactions: [...]`; orphan reactions are returned separately. |
-| `messages search <query> [--chat <guid>] [--since DUR] [--limit N]` | Server-side text search across the iMessage DB |
-| `messages get <message-guid>` | Single message detail (including attachment metadata) |
-| `attachments download <guid> [--out PATH]` | Save an attachment to disk (default: `~/Downloads/bluebubbles-relay/`) |
+| `messages list [--since 5m\|1h\|2d] [--chat <guid>] [--limit N]` | Recent messages. The bread-and-butter call for "any new texts?". Each message includes inline `attachments: [{guid, transferName, mimeType, totalBytes}]` so you don't have to round-trip through `messages get` to know what's attached. Incoming reactions are grouped onto their target under `reactions: [...]`; orphan reactions are returned separately. |
+| `messages search <query> [--chat <guid>] [--since DUR] [--limit N]` | Server-side text search across the iMessage DB (also returns inline attachments) |
+| `messages get <message-guid>` | Single message detail |
+| `attachments download <guid> [--out PATH]` | Save an attachment to disk (default: `~/Downloads/bluebubbles-relay/`). If iMessage has GC'd the local file (old media), this returns a clear error rather than silently producing an empty file. |
 | `stickers list` | Names of stickers in the repo's `stickers/` directory |
 
 ### Resolving people → GUIDs
@@ -80,6 +80,9 @@ Tapbacks (love / like / dislike / laugh / emphasize / question) appear in BlueBu
 | `messages react <message-guid> <reaction> --confirm` | Send a tapback. Valid: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`, and `-love` etc. to remove. **Requires BlueBubbles Private API to be enabled.** `whoami` should report `private_api_enabled: true`, otherwise this returns HTTP 500. |
 | `messages send-image <chat-guid> <path-or-URL> [--text caption] --confirm` | Send an image. Source can be a local file path on the relay or an `http(s)://` URL (downloaded to a tempfile, sent, then deleted). Caption is sent as a follow-up text. |
 | `messages send-sticker <chat-guid> <name> [--text caption] --confirm` | Send a sticker from the repo's `stickers/` library by stem-name |
+| `messages reply <message-guid> <text> --confirm` | **Convenience**: reply to a specific message. Auto-resolves the chat from the message GUID — no need to look up the chat separately. |
+| `messages reply-image <message-guid> <path-or-URL> [--text caption] --confirm` | Same auto-resolve, for images |
+| `messages reply-sticker <message-guid> <name> [--text caption] --confirm` | Same auto-resolve, for stickers |
 
 **Never call a write command without showing the user what's about to go out and getting explicit approval.**
 
@@ -92,6 +95,8 @@ Tapbacks (love / like / dislike / laugh / emphasize / question) appear in BlueBu
 The repo ships a `stickers/` directory you can populate with `.png` / `.webp` files. Each file is discoverable by its stem (filename without extension) via `stickers list`. Path-traversal is blocked at the CLI level (no `/`, `\`, or `..` in names), so you can't accidentally send arbitrary files via this command — use `send-image` for that.
 
 The shipped pack includes a few hundred peepo / pepe PNGs as a starting set. Drop your own files in to extend.
+
+> **Important:** iMessage does **not** understand Discord/Twitch-style emote text like `:peepoHappy:`. If you type that, it sends the literal characters as plain text — the recipient sees `:peepoHappy:`, not a sticker. To send an actual sticker image, use `messages send-sticker` or `messages reply-sticker`.
 
 ## Safety rules
 
@@ -173,6 +178,16 @@ User: "send a peepo to the group chat with the boys"
 → stickers list   if you don't already know names
 → Confirm: "Sending peepoHappy to <group-name> — go?"
 → messages send-sticker <chat-guid> peepoHappy --confirm
+```
+
+### "Reply to that specific message with a sticker"
+
+```text
+User: "reply peepoNerd to Sarah's last message"
+→ Find Sarah's most recent message GUID from messages list --chat <sarah-guid> --limit 5
+→ Confirm: "Replying with sticker peepoNerd to Sarah's 'fix it nerd' from 3:14pm — go?"
+→ messages reply-sticker <message-guid> peepoNerd --confirm
+   (No need to separately look up the chat GUID — reply-sticker resolves it.)
 ```
 
 ## Troubleshooting
